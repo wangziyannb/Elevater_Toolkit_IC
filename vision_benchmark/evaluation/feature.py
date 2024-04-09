@@ -38,7 +38,7 @@ nltk.download('punkt')
 nltk.download('wordnet')
 
 import pdb
-
+from transformers import CLIPProcessor, CLIPModel
 from collections import Counter
 import math
 import random
@@ -142,7 +142,8 @@ def get_dataloader(dataset, val_split=0.0, batch_size_per_gpu=64, workers=6, pin
 
                 for label in cls_to_count:
                     n_samples = math.ceil(cls_to_count[label] * val_split)
-                    samples = np.where(labels == label)[0][:n_samples]      # TODO: not doing random. confirm that it is unnecessary
+                    samples = np.where(labels == label)[0][
+                              :n_samples]  # TODO: not doing random. confirm that it is unnecessary
                     val_indices.append(samples)
                 val_idx = set(np.concatenate(val_indices).tolist())
                 train_idx = set(list(range(len(dataset)))) - val_idx
@@ -243,6 +244,14 @@ def load_custom_zeroshot_model(config):
     return model
 
 
+def get_model_test(config, feature_type='image'):
+    model = CLIPModel.from_pretrained(config.MODEL.NAME)
+    processor = CLIPProcessor.from_pretrained(config.MODEL.NAME)
+    pytorch_total_params = sum(p.numel() for p in model.parameters())
+    logging.info(f'Number of params: {pytorch_total_params / 1000000}M.')
+    return processor, model
+
+
 def get_model(config, feature_type='image'):
     model_name = config.MODEL.NAME
     if model_name in dir(torchvision.models):
@@ -298,9 +307,10 @@ def get_model(config, feature_type='image'):
             else:
                 raise Exception('Incorrect model type')
         elif config.LOSS.LOSS == 'contrast':
-            logging.info(f'Training objective: { config.LOSS.LOSS }.')
+            logging.info(f'Training objective: {config.LOSS.LOSS}.')
 
     else:
+
         if config.MODEL.CLIP_FP32:
             import clip_vlp as clip
         else:
@@ -316,6 +326,7 @@ def get_model(config, feature_type='image'):
             logging.info(f'Using CLIP pretrained model {model_name}, input size {model.visual.input_resolution}')
 
             if len(config.TEST.MODEL_FILE) > 0:
+
                 logging.info(f'Special CLIP checkpoint specified, loading: {config.TEST.MODEL_FILE}')
                 model_file = config.TEST.MODEL_FILE
                 if model_file.startswith('hf:'):
@@ -343,7 +354,9 @@ def get_model(config, feature_type='image'):
     return model
 
 
-def extract_feature(model, data_loader, config):
+def extract_feature(model, data_loader, config, processor=None):
+    if processor is None:
+        return
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     model.to(device)
     model.eval()
@@ -362,13 +375,18 @@ def extract_feature(model, data_loader, config):
     all_labels = []
     with torch.no_grad():
         for batch in tqdm(data_loader, f'Extracting features with model {config.MODEL.NAME}.'):
+
             x, y = batch[:2]
 
             # compute output
             if device == torch.device('cuda'):
+                # x = list(torch.unbind(x, dim=0))
+                # x = processor(images=x, return_tensors='pt')
+                # x = x.to(device)
                 x = x.cuda(non_blocking=True)
                 y = y.cuda(non_blocking=True)
-            outputs = model(x)
+
+            outputs = model.get_image_features(x)
             all_features.append(outputs.cpu().numpy())
             all_labels.append(y.cpu().numpy())
 
@@ -389,17 +407,22 @@ def multiclass_to_int(indices):
     return indices[0]
 
 
-def extract_features(config, feature_type="image", test_split_only=False):
-    model = get_model(config, feature_type=feature_type)
+def extract_features(config, feature_type="image", test_split_only=False, model=None, processor=None):
+    if not model or not processor:
+        model = CLIPModel.from_pretrained(config.MODEL.NAME)
+        processor = CLIPProcessor.from_pretrained(config.MODEL.NAME)
 
-    train_dataloader, val_dataloader, test_dataloader = construct_dataloader(config, feature_type="image", test_split_only=test_split_only)
+    train_dataloader, val_dataloader, test_dataloader = construct_dataloader(config, processor=processor,
+                                                                             feature_type="image",
+                                                                             test_split_only=test_split_only)
 
-    test_features, test_labels = extract_feature(model, test_dataloader, config)
+    test_features, test_labels = extract_feature(model, test_dataloader, config, processor)
     if test_split_only:
         return test_features, test_labels
-    train_features, train_labels = extract_feature(model, train_dataloader, config)
-    val_features, val_labels = extract_feature(model, val_dataloader, config)
+    train_features, train_labels = extract_feature(model, train_dataloader, config, processor)
+    val_features, val_labels = extract_feature(model, val_dataloader, config, processor)
     return train_features, train_labels, val_features, val_labels, test_features, test_labels
+
 
 def hypernyms_chain(concept):
     ss = wn.synsets(concept)
@@ -408,13 +431,14 @@ def hypernyms_chain(concept):
 
     while len(ss) > 0:
         ss = ss[0]
-        
-        hypernyms_chain.append(ss.lemmas()[0].name() )
+
+        hypernyms_chain.append(ss.lemmas()[0].name())
         # print(f'{ss.name()}, {ss.definition()}, {ss.hypernyms()}')
         ss = ss.hypernyms()
 
     hypernyms_chain = ' '.join(hypernyms_chain)
     return hypernyms_chain
+
 
 def concept_definition(concept):
     ss = wn.synsets(concept)
@@ -426,48 +450,47 @@ def concept_definition(concept):
     return definition
 
 
-
-
 @torch.no_grad()
-def extract_text_features(config, tokenizer, args=None, model=None, return_numpy=True):
+def extract_text_features(config, processor, model=None, args=None, tokenizer=None, return_numpy=True):
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     class_names = class_map.get(config.DATASET.DATASET)
     if not class_names:
         hub = get_dataset_hub()
         from vision_datasets import Usages
-        manifest = hub.create_dataset_manifest(VISION_DATASET_STORAGE, None, config.DATASET.DATASET, usage=Usages.TEST_PURPOSE)
+        manifest = hub.create_dataset_manifest(VISION_DATASET_STORAGE, None, config.DATASET.DATASET,
+                                               usage=Usages.TEST_PURPOSE)
         if manifest:
             class_names = manifest[0].labelmap
 
     if config.KNOWLEDGE.WIKITIONARY.USE_DEFINITION:
         wiki_path = config.KNOWLEDGE.WIKITIONARY.WIKI_DICT_PATH
-        wiki_tsv_path = os.path.join(wiki_path,  config.DATASET.DATASET + '_knowledge.tsv') 
+        wiki_tsv_path = os.path.join(wiki_path, config.DATASET.DATASET + '_knowledge.tsv')
         wiki_anwser_list = json.load(open(wiki_tsv_path, encoding='utf-8'))
 
         count_has_wiki_knowledge = 0
         wiki_dict = {}
         for k2v in wiki_anwser_list:
-            wiki_dict[ k2v['classname'] ] = k2v['def_wiki']   
+            wiki_dict[k2v['classname']] = k2v['def_wiki']
             if k2v['def_wiki']:
                 count_has_wiki_knowledge += 1
         logging.info(f'coverage is {count_has_wiki_knowledge} / {len(wiki_dict)}')
 
     if config.KNOWLEDGE.WORDNET.USE_DEFINITION:
         wiki_path = config.KNOWLEDGE.WIKITIONARY.WIKI_DICT_PATH
-        wiki_tsv_path = os.path.join(wiki_path,  config.DATASET.DATASET + '_knowledge.tsv') 
+        wiki_tsv_path = os.path.join(wiki_path, config.DATASET.DATASET + '_knowledge.tsv')
         wiki_anwser_list = json.load(open(wiki_tsv_path, encoding='utf-8'))
 
         count_has_wiki_knowledge = 0
         wiki_dict = {}
         for k2v in wiki_anwser_list:
-            wiki_dict[ k2v['classname'] ] = k2v['def_wn']   
+            wiki_dict[k2v['classname']] = k2v['def_wn']
             if k2v['def_wn']:
                 count_has_wiki_knowledge += 1
         logging.info(f'coverage is {count_has_wiki_knowledge} / {len(wiki_dict)}')
 
     if config.KNOWLEDGE.WORDNET.USE_HIERARCHY:
         wiki_path = config.KNOWLEDGE.WIKITIONARY.WIKI_DICT_PATH
-        wiki_tsv_path = os.path.join(wiki_path,  config.DATASET.DATASET + '_knowledge.tsv') 
+        wiki_tsv_path = os.path.join(wiki_path, config.DATASET.DATASET + '_knowledge.tsv')
         wiki_anwser_list = json.load(open(wiki_tsv_path, encoding='utf-8'))
 
         count_has_wiki_knowledge = 0
@@ -477,25 +500,25 @@ def extract_text_features(config, tokenizer, args=None, model=None, return_numpy
                 path_length = min(3, len(k2v['path_wn']))
                 path_wn = ' '.join(k2v['path_wn'][:path_length])
 
-            else: 
-                path_wn = k2v['path_wn']   
-            wiki_dict[ k2v['classname'] ] = path_wn
+            else:
+                path_wn = k2v['path_wn']
+            wiki_dict[k2v['classname']] = path_wn
             if k2v['path_wn']:
                 count_has_wiki_knowledge += 1
         logging.info(f'coverage is {count_has_wiki_knowledge} / {len(wiki_dict)}')
 
     if config.KNOWLEDGE.GPT3.USE_GPT3:
         gpt3_path = config.KNOWLEDGE.GPT3.GPT3_DICT_PATH
-        gpt3_tsv_path = os.path.join(gpt3_path,  'GPT3_' + config.DATASET.DATASET + '.tsv') 
+        gpt3_tsv_path = os.path.join(gpt3_path, 'GPT3_' + config.DATASET.DATASET + '.tsv')
         gpt3_anwser_list = json.load(open(gpt3_tsv_path, encoding='utf-8'))
 
         gpt3_dict = {}
         for k2v in gpt3_anwser_list:
-            gpt3_dict[ k2v['classname'] ] = k2v['gpt3']
+            gpt3_dict[k2v['classname']] = k2v['gpt3']
 
     if args is not None and args.text_feature_only:
         return wiki_dict, gpt3_dict
-    
+
     templates = template_map.get(config.DATASET.DATASET, ['a photo of a {}'])
     if model is None:
         model = get_model(config, feature_type='text')
@@ -518,13 +541,13 @@ def extract_text_features(config, tokenizer, args=None, model=None, return_numpy
             if config.KNOWLEDGE.AGGREGATION.MEHTOD == 'WIKI_AND_GPT3':
                 for knowledge_text in gpt3_dict[classname][:config.KNOWLEDGE.AGGREGATION.NUM_GPT3_ITEMS]:
                     knowledge_text_list.append(knowledge_text)
-                    gpt3_count += 1          
-            
+                    gpt3_count += 1
+
             elif config.KNOWLEDGE.AGGREGATION.MEHTOD == 'WIKI_THEN_GPT3' and len(knowledge_text_list) == 0:
                 for knowledge_text in gpt3_dict[classname][:config.KNOWLEDGE.AGGREGATION.NUM_GPT3_ITEMS]:
                     knowledge_text_list.append(knowledge_text)
                     gpt3_count += 1
-        
+
         knowledge_text_list_aug = []
         for knowledge_text in knowledge_text_list:
             knowledge_text = f' ; {classname} , ' + knowledge_text if knowledge_text is not None else ''
@@ -532,17 +555,23 @@ def extract_text_features(config, tokenizer, args=None, model=None, return_numpy
             knowledge_text_list_aug.append(knowledge_text)
 
         if len(knowledge_text_list_aug) == 0:
-            texts = [template.format(classname) for template in templates ]
+            texts = [template.format(classname) for template in templates]
         else:
-            texts = [template.format(classname) + knowledge_text for knowledge_text in knowledge_text_list_aug for template in templates ]
+            texts = [template.format(classname) + knowledge_text for knowledge_text in knowledge_text_list_aug for
+                     template in templates]
 
-        if not config.MODEL.SPEC.TEXT.get('SKIP_TOKENIZE', False):
-            texts = tokenizer(texts, context_length=config.MODEL.SPEC.TEXT.CONTEXT_LENGTH).to(device)
+        texts = processor(text=texts, return_tensors="pt", padding=True).to(device)
 
-        if config.MODEL.SPEC.get('DENSE_EVAL', False):
-            class_embeddings = model.encode_text_dense(texts)
-        else:
-            class_embeddings = model.encode_text(texts)
+        # texts = tokenizer(texts, context_length=config.MODEL.SPEC.TEXT.CONTEXT_LENGTH).to(device)
+        # if not config.MODEL.SPEC.TEXT.get('SKIP_TOKENIZE', False):
+        #     texts = tokenizer(texts, context_length=config.MODEL.SPEC.TEXT.CONTEXT_LENGTH).to(device)
+        #
+        # if config.MODEL.SPEC.get('DENSE_EVAL', False):
+        #     class_embeddings = model.encode_text_dense(texts)
+        # else:
+        #     class_embeddings = model.encode_text(texts)
+
+        class_embeddings = model.get_text_features(**texts)
         class_embeddings /= class_embeddings.norm(dim=-1, keepdim=True)
         class_embedding = class_embeddings.mean(dim=0)
         class_embedding /= class_embedding.norm()
@@ -557,10 +586,11 @@ def extract_text_features(config, tokenizer, args=None, model=None, return_numpy
         return zeroshot_weights
 
 
-def construct_dataloader(config, feature_type="image", test_split_only=False):
+def construct_dataloader(config, processor, feature_type="image", test_split_only=False):
     if config.DATASET.CENTER_CROP:
         logging.info('Do center crop')
         transform_clip = transforms.Compose([
+            # transforms.ToTensor(),
             transforms.Resize(config.TRAIN.IMAGE_SIZE[0], interpolation=Image.BICUBIC),
             transforms.CenterCrop(size=config.TRAIN.IMAGE_SIZE),
             transforms.ToTensor(),
@@ -569,6 +599,7 @@ def construct_dataloader(config, feature_type="image", test_split_only=False):
     else:
         logging.info('no center crop')
         transform_clip = transforms.Compose([
+            # transforms.ToTensor(),
             transforms.Resize(config.TRAIN.IMAGE_SIZE, interpolation=Image.BICUBIC),
             transforms.ToTensor(),
             transforms.Normalize(mean=config.INPUT.MEAN, std=config.INPUT.STD),
@@ -583,11 +614,12 @@ def construct_dataloader(config, feature_type="image", test_split_only=False):
         local_temp = config.DATASET.ROOT
 
         # return [manifest, dataset_info, downloader_resources]
-        results = hub.create_dataset_manifest(vision_dataset_storage, local_temp, config.DATASET.DATASET, usage=Usages.TEST_PURPOSE)
+        results = hub.create_dataset_manifest(vision_dataset_storage, local_temp, config.DATASET.DATASET,
+                                              usage=Usages.TEST_PURPOSE)
         if results:
             test_set, test_set_dataset_info, _ = results
         logging.info(f'Test size is {len(test_set.images)}.')
-        
+
         # re-define transform_clip to organize the labels
         if test_set_dataset_info.type == DatasetTypes.IC_MULTILABEL:
             previous_transform = transform_clip
@@ -602,15 +634,18 @@ def construct_dataloader(config, feature_type="image", test_split_only=False):
                 return (previous_transform(x), multiclass_to_int(y))
 
         train_dataloader = val_dataloader = None
-        test_dataloader = get_dataloader(TorchDataset(ManifestDataset(test_set_dataset_info, test_set), transform=transform_clip))
+        test_dataloader = get_dataloader(
+            TorchDataset(ManifestDataset(test_set_dataset_info, test_set), transform=transform_clip))
         # download train/val split only if test_split_only is False
         if not test_split_only:
-            train_set_results = hub.create_dataset_manifest(vision_dataset_storage, local_temp, config.DATASET.DATASET, usage=Usages.TRAIN_PURPOSE)
+            train_set_results = hub.create_dataset_manifest(vision_dataset_storage, local_temp, config.DATASET.DATASET,
+                                                            usage=Usages.TRAIN_PURPOSE)
             if train_set_results:
                 train_set, train_set_dataset_info, _ = train_set_results
 
             val_set = None
-            val_set_results = hub.create_dataset_manifest(vision_dataset_storage, local_temp, config.DATASET.DATASET, usage=Usages.VAL_PURPOSE)
+            val_set_results = hub.create_dataset_manifest(vision_dataset_storage, local_temp, config.DATASET.DATASET,
+                                                          usage=Usages.VAL_PURPOSE)
             if val_set_results:
                 val_set, val_set_dataset_info, _ = val_set_results
 
@@ -619,19 +654,30 @@ def construct_dataloader(config, feature_type="image", test_split_only=False):
                 num_samples_per_class = config.DATASET.NUM_SAMPLES_PER_CLASS
                 random_seed = config.DATASET.RANDOM_SEED_SAMPLING
                 train_set = train_set.sample_few_shot_subset(num_samples_per_class, random_seed)
-                
-            val_split=0.2
-            train_dataloader, val_dataloader = get_dataloader(TorchDataset( ManifestDataset(train_set_dataset_info, train_set), transform=transform_clip), val_split=val_split)
-            logging.info(f'Val split from Train set: Train size is {len(train_set.images)*(1-val_split)}, and validation size is {len(train_set.images)*val_split}.')
+
+            val_split = 0.2
+            train_dataloader, val_dataloader = get_dataloader(
+                TorchDataset(ManifestDataset(train_set_dataset_info, train_set), transform=transform_clip),
+                val_split=val_split)
+            logging.info(
+                f'Val split from Train set: Train size is {len(train_set.images) * (1 - val_split)}, and validation size is {len(train_set.images) * val_split}.')
     else:
         train_dataloader = val_dataloader = None
         if not test_split_only:
             if config.DATASET.VAL_SET:
-                train_dataloader = get_dataloader(torchvision.datasets.ImageFolder(os.path.join(config.DATASET.ROOT, config.DATASET.TRAIN_SET), transform=transform_clip))
-                val_dataloader = get_dataloader(torchvision.datasets.ImageFolder(os.path.join(config.DATASET.ROOT, config.DATASET.VAL_SET), transform=transform_clip))
+                train_dataloader = get_dataloader(
+                    torchvision.datasets.ImageFolder(os.path.join(config.DATASET.ROOT, config.DATASET.TRAIN_SET),
+                                                     transform=transform_clip))
+                val_dataloader = get_dataloader(
+                    torchvision.datasets.ImageFolder(os.path.join(config.DATASET.ROOT, config.DATASET.VAL_SET),
+                                                     transform=transform_clip))
             else:
-                train_dataloader, val_dataloader = get_dataloader(torchvision.datasets.ImageFolder(os.path.join(config.DATASET.ROOT, config.DATASET.TRAIN_SET), transform=transform_clip),
-                                                                    val_split=0.2)
-        test_dataloader = get_dataloader(torchvision.datasets.ImageFolder(os.path.join(config.DATASET.ROOT, config.DATASET.TEST_SET), transform=transform_clip))
+                train_dataloader, val_dataloader = get_dataloader(
+                    torchvision.datasets.ImageFolder(os.path.join(config.DATASET.ROOT, config.DATASET.TRAIN_SET),
+                                                     transform=transform_clip),
+                    val_split=0.2)
+        test_dataloader = get_dataloader(
+            torchvision.datasets.ImageFolder(os.path.join(config.DATASET.ROOT, config.DATASET.TEST_SET),
+                                             transform=transform_clip))
 
     return train_dataloader, val_dataloader, test_dataloader

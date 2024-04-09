@@ -10,6 +10,7 @@ import argparse
 import logging
 
 import numpy as np
+from transformers import CLIPModel, CLIPProcessor
 
 from vision_benchmark.common.utils import log_arg_env_config
 from vision_benchmark.utils import comm, create_logger
@@ -22,22 +23,31 @@ def add_zero_shot_args(parser):
     parser.add_argument('--ds', required=False, help='Evaluation dataset configure file name.', type=str)
     parser.add_argument('--model', required=True, help='Clip model configure file name', type=str)
     parser.add_argument('--text_feature_only', help='consider text feature or not.', default=False, action='store_true')
-    parser.add_argument('--save-predictions', help='save predictions logits for analysis.', default=True, type=lambda x: (str(x).lower() == 'true'))
+    parser.add_argument('--save-predictions', help='save predictions logits for analysis.', default=True,
+                        type=lambda x: (str(x).lower() == 'true'))
     parser.add_argument('opts',
                         help="Modify config options using the command-line",
                         default=None,
-                        nargs=argparse.REMAINDER)    
+                        nargs=argparse.REMAINDER)
+
 
 def load_or_extract_features(args, cfg):
-    if cfg.MODEL.SPEC.TEXT.TOKENIZER == 'clip':
-        tokenizer = SimpleTokenizer()
-    elif 'hf_' in cfg.MODEL.SPEC.TEXT.TOKENIZER:
-        tokenizer = HFPTTokenizer(pt_name=cfg.MODEL.SPEC.TEXT.TOKENIZER[3:])
-    else:
-        tokenizer = None
+    # if cfg.MODEL.SPEC.TEXT.TOKENIZER == 'clip':
+    #     tokenizer = SimpleTokenizer()
+    # elif 'hf_' in cfg.MODEL.SPEC.TEXT.TOKENIZER:
+    #     tokenizer = HFPTTokenizer(pt_name=cfg.MODEL.SPEC.TEXT.TOKENIZER[3:])
+    # else:
+    #     tokenizer = None
+
+    model = CLIPModel.from_pretrained(config.MODEL.NAME)
+    processor = CLIPProcessor.from_pretrained(config.MODEL.NAME)
+    logging.info(f'Load model and processor: {config.MODEL.NAME}')
+    pytorch_total_params = sum(p.numel() for p in model.parameters())
+    logging.info(f'Number of params: {pytorch_total_params / 1000000}M.')
 
     # Load or extract image features.
-    feature_file = os.path.join(cfg.DATASET.ROOT, 'zeroshot_features_' + cfg.MODEL.NAME.replace('/', '') + f'_wiki_{cfg.KNOWLEDGE.WIKITIONARY.USE_DEFINITION}' + f'_gpt3_{cfg.KNOWLEDGE.GPT3.USE_GPT3}' + '.npy')
+    feature_file = os.path.join(cfg.DATASET.ROOT, 'zeroshot_features_' + cfg.MODEL.NAME.replace('/',
+                                                                                                '') + f'_wiki_{cfg.KNOWLEDGE.WIKITIONARY.USE_DEFINITION}' + f'_gpt3_{cfg.KNOWLEDGE.GPT3.USE_GPT3}' + '.npy')
     logging.info(f'feature_file: {feature_file}')
     if os.path.exists(feature_file):
         logging.info('Loading features from existing files.')
@@ -46,32 +56,33 @@ def load_or_extract_features(args, cfg):
             text_features = np.load(fread)
             image_labels = np.load(fread)
     else:
-        image_features, image_labels = extract_features(cfg, test_split_only=True)
-        text_features = extract_text_features(cfg, tokenizer, args)
+        image_features, image_labels = extract_features(config, test_split_only=True, model=model, processor=processor)
+        text_features = extract_text_features(cfg, model=model, processor=processor, args=args)
     logging.info(f'Test size is {image_features.shape[0]}.')
 
     return image_features, text_features, image_labels
 
-def load_or_extract_text_features(args, cfg):
-    if cfg.MODEL.SPEC.TEXT.TOKENIZER == 'clip':
-        tokenizer = SimpleTokenizer()
-    elif 'hf_' in cfg.MODEL.SPEC.TEXT.TOKENIZER:
-        tokenizer = HFPTTokenizer(pt_name=cfg.MODEL.SPEC.TEXT.TOKENIZER[3:])
-    else:
-        tokenizer = None
 
-    # Load or extract image features.
-    feature_file = os.path.join(cfg.DATASET.ROOT, 'zeroshot_text_features_' + cfg.MODEL.NAME.replace('/', '') + f'_wiki_{cfg.KNOWLEDGE.WIKITIONARY.USE_DEFINITION}' + f'_gpt3_{cfg.KNOWLEDGE.GPT3.USE_GPT3}' + '.npy')
-    logging.info(f'feature_file: {feature_file}')
-    if os.path.exists(feature_file):
-        logging.info('Loading features from existing files.')
-        with open(feature_file, 'rb') as fread:
-            text_features = np.load(fread)
-    else:
-        wiki_dict, gpt3_dict = extract_text_features(cfg, tokenizer, args)
-    logging.info(f'Test size is {len(wiki_dict)}.')
-
-    return wiki_dict, gpt3_dict
+# def load_or_extract_text_features(args, cfg):
+#     # if cfg.MODEL.SPEC.TEXT.TOKENIZER == 'clip':
+#     #     tokenizer = SimpleTokenizer()
+#     # elif 'hf_' in cfg.MODEL.SPEC.TEXT.TOKENIZER:
+#     #     tokenizer = HFPTTokenizer(pt_name=cfg.MODEL.SPEC.TEXT.TOKENIZER[3:])
+#     # else:
+#     #     tokenizer = None
+#
+#     # Load or extract image features.
+#     feature_file = os.path.join(cfg.DATASET.ROOT, 'zeroshot_text_features_' + cfg.MODEL.NAME.replace('/', '') + f'_wiki_{cfg.KNOWLEDGE.WIKITIONARY.USE_DEFINITION}' + f'_gpt3_{cfg.KNOWLEDGE.GPT3.USE_GPT3}' + '.npy')
+#     logging.info(f'feature_file: {feature_file}')
+#     if os.path.exists(feature_file):
+#         logging.info('Loading features from existing files.')
+#         with open(feature_file, 'rb') as fread:
+#             text_features = np.load(fread)
+#     else:
+#         wiki_dict, gpt3_dict = extract_text_features(cfg, tokenizer, args)
+#     logging.info(f'Test size is {len(wiki_dict)}.')
+#
+#     return wiki_dict, gpt3_dict
 
 def main():
     parser = argparse.ArgumentParser(description='Zero-shot evaluation script.')
@@ -94,8 +105,8 @@ def main():
         log_arg_env_config(args, config, final_output_dir)
 
     if args.text_feature_only:
-        wiki_dict, gpt3_dict = load_or_extract_text_features(args, config)
-
+        # wiki_dict, gpt3_dict = load_or_extract_text_features(args, config)
+        print("disabled")
     else:
         image_features, text_features, image_labels = load_or_extract_features(args, config)
         result, test_predictions, metric = clip_zeroshot_evaluator(image_features, text_features, image_labels, config)
@@ -125,7 +136,7 @@ def main():
 
         prediction_folder = os.path.join(config.OUTPUT_DIR, 'predictions', exp_name)
         os.makedirs(prediction_folder, exist_ok=True)
-        with open(os.path.join(prediction_folder, f'{config.DATASET.DATASET}.json' ) , 'w') as outfile:
+        with open(os.path.join(prediction_folder, f'{config.DATASET.DATASET}.json'), 'w') as outfile:
             outfile.write(json_string)
 
 
